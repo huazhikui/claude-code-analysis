@@ -1,50 +1,297 @@
-# MCP 技术实现细节与运行机制
+# 第七章：MCP 技术实现细节与运行机制
 
 [返回总目录](../README.md)
 
-MCP (Model Context Protocol) 是一种开放标准，目的在于连接 AI 模型与各种外部的数据源代码和工具箱。在 Claude Code 中，由于本地系统权限局限或特定场景需要接入外部能力，系统高度集成了 MCP 协议层的对接实现。
+---
 
-根据静态代码分析，主要负责对接网络与通讯的核心实现在 [`src/services/mcp/client.ts`](../src/services/mcp/client.ts) 之中，它是承载这套协议并转化为大模型能力的核心层。
+## 1. 导读
 
-## 1. 核心架构与底层 Client 构建
+MCP（Model Context Protocol）是 Anthropic 主导的开放标准，让 AI 模型能统一接入外部工具和数据源。Claude Code 对 MCP 做了深度集成，支持四种传输协议、完整的认证体系和并发安全管理。
 
-Claude Code 的底层完全利用了官方开源的 `@modelcontextprotocol/sdk`。但它并不是简单封装调用，而是根据不同的宿主连接层级与传输网络做了大量的二次包装和安全处理：
+主要源文件：
+- [`src/services/mcp/client.ts`](../src/services/mcp/client.ts) — MCP 客户端核心
+- [`src/services/mcp/auth.ts`](../src/services/mcp/auth.ts) — OAuth 认证与 Step-up 检测
+- [`src/services/mcp/mcpStringUtils.ts`](../src/services/mcp/mcpStringUtils.ts) — 工具命名规则
+- [`src/utils/mcpWebSocketTransport.ts`](../src/utils/mcpWebSocketTransport.ts) — WebSocket 传输层
 
-在 [`connectToServer`](../src/services/mcp/client.ts) 的设计中，系统支持多种维度的 MCP 连接类型（`serverRef.type`）：
-- **Stdio (`stdio`)：** 默认与最为常见的标准输入输出挂载调用方式。适合调用本地进程作为插件提供端。底层由 `StdioClientTransport` 承载。
-- **SSE (`sse` / `sse-ide`)：** 以 Server-Sent Events 为载体，借助长链接事件流来与远程服务器做桥接。使用 `SSEClientTransport`，通过 [`wrapFetchWithStepUpDetection`](../src/services/mcp/auth.ts) 处理鉴权流程。
-- **WebSocket (`ws` / `ws-ide`)：** 原生的流式跨端连接，专门为长久运行的通道（如通过 IDE 提供上下文）所设计。使用 [`WebSocketTransport`](../src/utils/mcpWebSocketTransport.ts)。
-- **HTTP / Streamable Proxy：** 这是其中较为复杂的扩展。除了基本的 HTTP/Proxy 请求支持外，系统内部特殊设计了 [`createClaudeAiProxyFetch`](../src/services/mcp/client.ts) 以防在访问 `claude.ai` 等远程私有节点时遭遇 OAuth 过期等拦截（它会在底层主动触发 Token Refresh 和轮转）。
+---
 
-每一个 HTTP 请求都被 [`wrapFetchWithTimeout`](../src/services/mcp/client.ts) 包裹，以解决 `AbortSignal.timeout()` 在 Bun 运行时内存泄漏的问题，同时保证长链接的 SSE 流不被 60 秒超时机制误杀。
+## 2. 工具命名规则
 
-## 2. API 的转化与映射
+所有 MCP 工具在被统一进工具池时，名称通过 `buildMcpToolName()` 规范化：
 
-当 MCP Server 被成功连接并返回功能列表后：
+```typescript
+// src/services/mcp/mcpStringUtils.ts
+export function buildMcpToolName(serverName: string, toolName: string): string {
+  return `mcp__${serverName}__${toolName}`
+  // 示例：
+  //   mcp__filesystem__read_file
+  //   mcp__puppeteer__screenshot
+  //   mcp__ide__getDiagnostics
+}
+```
 
-1. **Tool 列表转换：** 系统将 MCP 返回的方法转化为内部通用的 [`MCPTool`](../src/tools/MCPTool/MCPTool.ts) 实例类或 `Command`。这是极其重要的隔离抽象层。这意味着无论是本地 `BashTool` 还是外部一个未知的远程工具，在大模型的眼中，都只是普通的统一 Schema 的描述能力。命名规则由 [`buildMcpToolName`](../src/services/mcp/mcpStringUtils.ts) 统一拼装（格式为 `mcp__<serverName>__<toolName>`）。
-2. **描述长度防膨胀拦截：** OpenAPI 衍生出的某些 MCP Tool 会包含成千上万字的冗长字段描述。为了避免大模型的上下文（Context Window）被毫无意义地污染甚至超限（OOM），在 [`client.ts`](../src/services/mcp/client.ts) 中定义了强硬拦截常量 `MAX_MCP_DESCRIPTION_LENGTH = 2048`，强制修剪超过 2K 的 Payload 返回体指令。
+这个一致的命名格式让工具池中的 MCP 工具和内建工具保持统一 schema，模型无需区分来源。
 
-## 3. 请求控制面与异常处理
+---
 
-1. **资源并发控制（Batch 控制）：**
-   由 [`getMcpServerConnectionBatchSize`](../src/services/mcp/client.ts) 和 [`getRemoteMcpServerConnectionBatchSize`](../src/services/mcp/client.ts) 两个函数分别定义本地与远程服务的并发连接批次上限（可通过 `MCP_SERVER_CONNECTION_BATCH_SIZE` / `MCP_REMOTE_SERVER_CONNECTION_BATCH_SIZE` 环境变量覆盖）。以此避免在初始化应用时因太多 MCP 连接而导致启动卡死。
+## 3. 连接管理：`connectToServer()`
 
-2. **Session 过期与 Auth 高速缓存控制 (Auth Cache Control)：**
-   连接远程 MCP 最危险的地方在于"连锁认证风暴"。
-   假如一个 Token 无效，上百个工具子调用并发会造成极其可怕的 4xx 无效雪崩重试。在 [`client.ts`](../src/services/mcp/client.ts) 中有着严密的闭环：使用 [`McpAuthCacheData`](../src/services/mcp/client.ts) 类型（写入到本地如 `mcp-needs-auth-cache.json`，通过 [`getMcpAuthCache`](../src/services/mcp/client.ts) 加载、[`setMcpAuthCacheEntry`](../src/services/mcp/client.ts) 写入），配合着约 15 分钟的 `MCP_AUTH_CACHE_TTL_MS`，保证一个 ServerId 倘若认证失败，后续所有的对应 MCP 会立马阻断而直接报告 `needs-auth`，绝不滥发导致浪费 Token 并拖垮响应进度。
+**真实源码**（[`src/services/mcp/client.ts:595`](../src/services/mcp/client.ts)）：
 
-3. **HTTP 代理打通 (Proxy Mount)：**
-   部分组织网络具备防火墙限制，系统在针对 `fetch` 和甚至 WebSocket（利用 [`getWebSocketProxyAgent`](../src/utils/proxy.ts) 和底层打通）级别全面支持读取进程周边的 HTTP Proxy 注入环境变量以便于内部网关下的 MCP 内省和使用。
+```typescript
+// 用 memoize 包装：同一 server 配置只建一次连接
+export const connectToServer = memoize(
+  async (
+    name: string,
+    serverRef: ScopedMcpServerConfig,
+    serverStats?: { totalServers: number; stdioCount: number; ... },
+  ): Promise<MCPServerConnection> => {
+    let transport
 
-4. **Session 过期重连：**
-   当 server 返回 HTTP 404 且附有 JSON-RPC `-32001` 错误码时，[`isMcpSessionExpiredError`](../src/services/mcp/client.ts) 检测为 Session 过期，系统会清除连接缓存，并重新调用 [`connectToServer`](../src/services/mcp/client.ts) 建立新会话。
+    // 根据 serverRef.type 选择传输层
+    if (serverRef.type === 'sse') {
+      const authProvider = new ClaudeAuthProvider(name, serverRef)
+      transport = new SSEClientTransport(serverRef.url, {
+        authProvider,
+        fetch: wrapFetchWithTimeout(
+          wrapFetchWithStepUpDetection(createFetchWithInit(), authProvider)
+        ),
+      })
+    } else if (serverRef.type === 'ws' || serverRef.type === 'ws-ide') {
+      transport = new WebSocketTransport(serverRef.url)
+    } else if (serverRef.type === 'http' || serverRef.type === 'streamable-http') {
+      transport = new StreamableHTTPClientTransport(serverRef.url, {
+        fetch: wrapFetchWithTimeout(createClaudeAiProxyFetch(baseFetch)),
+      })
+    } else {  // 默认：stdio
+      transport = new StdioClientTransport({
+        command: serverRef.command,
+        args: serverRef.args,
+        env: serverRef.env,
+      })
+    }
 
-## 4. MCP 到应用的"双向"绑定
+    const client = new Client({ name: 'claude-code', version: ... })
+    await client.connect(transport)
+    return { client, transport, ... }
+  },
+  getServerCacheKey  // 缓存键 = name + JSON(serverRef)
+)
+```
 
-不止是 Claude 去调用 MCP，在此项目中，IDE 等设施也可以借由 `ws-ide` 及对应 Token 创建起向 Claude 发送或展示消息/控制事件的双向隧道。通过特权认证口，双方可以共享诊断信息（如 `mcp__ide__getDiagnostics`）甚至是让其具备底层代执行的能力。IDE 的白名单工具控制由 [`isIncludedMcpTool`](../src/services/mcp/client.ts) 函数实现，只允许 `ALLOWED_IDE_TOOLS` 中定义的少数高权限工具。
+四种传输协议对比：
 
-## 总结
+| 类型 | 适用场景 | 底层传输 |
+|------|----------|----------|
+| `stdio` | 本地进程（最常用） | `StdioClientTransport` |
+| `sse` / `sse-ide` | 远程 HTTP 长连接 | `SSEClientTransport` |
+| `ws` / `ws-ide` | 长久 WebSocket 通道（IDE集成）| `WebSocketTransport` |
+| `http` / `streamable-http` | HTTP + claude.ai 代理 | `StreamableHTTPClientTransport` |
 
-MCP 在此套大代码库里的价值不仅仅是为了多支持一种格式，更是为了实现业务解耦下的"平台化"（PaaS）。
-借助于底层的安全验证隔离、状态机维护、工具链截断及各种网络协议封装，大模型被赋能上了可以安全且跨地域调取远程能力并以极低开发门槛向当前代码上下文中注入私有知识（如企业自身内部 Wiki 等）的前期基础建设。
+---
+
+## 4. 超时控制：`wrapFetchWithTimeout()`
+
+**真实源码**（[`src/services/mcp/client.ts:492`](../src/services/mcp/client.ts)）：
+
+```typescript
+export function wrapFetchWithTimeout(baseFetch: FetchLike): FetchLike {
+  return async (url: string | URL, init?: RequestInit) => {
+    const method = (init?.method ?? 'GET').toUpperCase()
+
+    // GET 请求不加超时 —— SSE 是长连接 GET，不能被超时切断
+    if (method === 'GET') return baseFetch(url, init)
+
+    // 用 setTimeout 而非 AbortSignal.timeout()
+    // 原因：AbortSignal.timeout() 在 Bun 中内存泄漏（每请求约 2.4KB 在 GC 前一直残留）
+    const controller = new AbortController()
+    const timer = setTimeout(
+      c => c.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+      MCP_REQUEST_TIMEOUT_MS,
+      controller,
+    )
+    timer.unref?.()  // 不阻止进程退出
+
+    try {
+      const response = await baseFetch(url, { ...init, signal: controller.signal })
+      clearTimeout(timer)
+      return response
+    } catch (error) {
+      clearTimeout(timer)
+      throw error
+    }
+  }
+}
+```
+
+**工程细节**：注释直接解释了为什么不用更简洁的 `AbortSignal.timeout()`——这是针对 Bun 运行时的已知内存泄漏问题的针对性规避。
+
+---
+
+## 5. 描述长度限制
+
+```typescript
+// src/services/mcp/client.ts:218
+// 注释原文：OpenAPI-generated MCP servers have been observed dumping 15-60KB
+// of endpoint docs into tool.description; this caps the p95 tail without losing the intent.
+const MAX_MCP_DESCRIPTION_LENGTH = 2048
+```
+
+这个常量作用于工具列表转换阶段：所有超过 2048 字符的工具描述会被强制截断，防止（来自 OpenAPI 衍生 MCP 服务的）超长文档塞满模型的 Context Window。
+
+---
+
+## 6. 并发连接控制
+
+```typescript
+// src/services/mcp/client.ts:552
+export function getMcpServerConnectionBatchSize(): number {
+  // 可通过环境变量覆盖，默认 3 个并发（本地）
+  return parseInt(process.env.MCP_SERVER_CONNECTION_BATCH_SIZE || '', 10) || 3
+}
+
+function getRemoteMcpServerConnectionBatchSize(): number {
+  // 远端连接默认 20 个并发（网络 IO，并发价值更高）
+  return parseInt(process.env.MCP_REMOTE_SERVER_CONNECTION_BATCH_SIZE || '', 10) || 20
+}
+```
+
+通过 `pMap(servers, connectToServer, { concurrency: batchSize })` 控制连接并发，防止启动时大量 MCP 并发导致卡死。
+
+---
+
+## 7. 认证缓存：防止"认证雪崩"
+
+**问题背景**：如果一个 Token 失效，100 个并发工具子调用会同时发现 401/403，然后全部发起 Token 刷新请求——形成"认证雪崩"。
+
+**解决方案**：用本地文件缓存是否认证失败（[`src/services/mcp/client.ts:259`](../src/services/mcp/client.ts)）：
+
+```typescript
+type McpAuthCacheData = Record<string, { timestamp: number }>
+
+// 缓存文件路径：~/.claude/mcp-needs-auth-cache.json
+function getMcpAuthCachePath(): string { ... }
+
+// 读取（Promise 结果 memoize，避免并发读重复 fs.readFile）
+function getMcpAuthCache(): Promise<McpAuthCacheData> {
+  authCachePromise ??= readFile(getMcpAuthCachePath(), 'utf-8')
+    .then(data => jsonParse(data) as McpAuthCacheData)
+    .catch(() => ({}))
+  return authCachePromise
+}
+
+// 写入：标记某 serverId 认证失败
+function setMcpAuthCacheEntry(serverId: string): void {
+  // 异步写入，不阻塞调用方
+}
+
+// 校验：若服务 15 分钟内已知需要认证，直接返回 needs-auth 不重试
+async function isMcpAuthCached(serverId: string): Promise<boolean> {
+  const cache = await getMcpAuthCache()
+  const entry = cache[serverId]
+  if (!entry) return false
+  const MCP_AUTH_CACHE_TTL_MS = 15 * 60 * 1000  // 15 分钟
+  return Date.now() - entry.timestamp < MCP_AUTH_CACHE_TTL_MS
+}
+```
+
+**效果**：一个 Server 若认证失败，后续 15 分钟内所有对它的调用直接短路返回 `needs-auth`，不会消耗额外的 Token 和网络请求。
+
+---
+
+## 8. Session 过期检测与重连
+
+```typescript
+// src/services/mcp/client.ts:193
+export function isMcpSessionExpiredError(error: Error): boolean {
+  const httpStatus = (error as Error & { code?: number }).code
+  if (httpStatus !== 404) return false
+  // MCP 规范：Session 过期时服务端返回 HTTP 404 + JSON-RPC 错误码 -32001
+  return (
+    error.message.includes('"code":-32001') ||
+    error.message.includes('"code": -32001')
+  )
+}
+```
+
+当检测到 Session 过期时，系统清除连接缓存（`connectToServer.cache.clear()`）并重新调用 `connectToServer()` 建立新连接。
+
+---
+
+## 9. IDE 工具白名单
+
+IDE 集成（`ws-ide`）可以向 Claude 推送 LSP 诊断、代码上下文等信息，但不是所有 IDE 工具都被允许：
+
+```typescript
+// src/services/mcp/client.ts:569
+const ALLOWED_IDE_TOOLS = [
+  'mcp__ide__getDiagnostics',
+  'mcp__ide__getOpenEditorFiles',
+  // ... 仅少数高权限工具通过白名单
+]
+
+function isIncludedMcpTool(tool: Tool): boolean {
+  // non-IDE 工具全部允许；IDE 工具只允许白名单内的
+  return !tool.name.startsWith('mcp__ide__') || ALLOWED_IDE_TOOLS.includes(tool.name)
+}
+```
+
+---
+
+## 10. claude.ai 代理专属处理
+
+```typescript
+// src/services/mcp/client.ts:372
+export function createClaudeAiProxyFetch(innerFetch: FetchLike): FetchLike {
+  return async (url, init) => {
+    const response = await innerFetch(url, init)
+    // 若 claude.ai 返回 401（Token 过期），主动触发 OAuth Token Refresh 后重试
+    if (response.status === 401) {
+      await refreshOAuthToken()
+      return innerFetch(url, { ...init, headers: { ...getUpdatedAuthHeaders() } })
+    }
+    return response
+  }
+}
+```
+
+这个包装函数专门处理 claude.ai 端点的 OAuth 过期问题，让 HTTP MCP 连接无需用户手动重新登录。
+
+---
+
+## 11. 工具池集成
+
+MCP 工具加载后，通过 `assembleToolPool()` 与内建工具合并到统一的工具池：
+
+```typescript
+// src/tools.ts（伪代码）
+export function assembleToolPool(
+  permissionContext: ToolPermissionContext,
+  mcpTools: Tool[],
+): Tool[] {
+  const builtinTools = getTools(permissionContext)
+  return [
+    ...builtinTools,                           // 内建工具优先
+    ...mcpTools.filter(isIncludedMcpTool),     // MCP 工具白名单过滤
+  ]
+    .sort((a, b) => a.name.localeCompare(b.name))  // 排序
+    .filter(deduplicateByName())                    // 去重（内建优先）
+}
+```
+
+对模型而言，无论工具来自内建还是 MCP，都只是 `Tool` 接口的一个实例，Schema 完全一致。
+
+---
+
+## 12. 总结
+
+| 机制 | 实现要点 |
+|------|----------|
+| 连接建立 | `connectToServer()` memoize，4 种传输协议，支持 OAuth |
+| 超时控制 | `wrapFetchWithTimeout()` 用 `setTimeout` 规避 Bun 内存泄漏 |
+| 描述截断 | `MAX_MCP_DESCRIPTION_LENGTH = 2048`，防止上下文爆炸 |
+| 并发控制 | `pMap` 限并发，本地 3 / 远程 20 |
+| 认证雪崩防护 | 15 分钟 Auth Cache，失败一次即短路后续同 Server 请求 |
+| Session 重连 | 检测 HTTP 404 + JSON-RPC -32001，自动清缓存重连 |
+| IDE 隔离 | `isIncludedMcpTool()` 白名单控制 IDE 推送能力边界 |
