@@ -210,25 +210,220 @@ export default { isEnabled: () => false, isHidden: true, name: 'stub' };
 
 这说明它不是普通欢迎文案，而是已经进入对话协议层的一种“第二角色”设计。
 
-### 6.2 companion 还是按用户身份确定性孵化的
+### 6.2 companion 的“骨架”和“灵魂”是分开存的
 
-[`src/buddy/companion.ts`](../src/buddy/companion.ts) 更有意思：
+[`src/buddy/companion.ts`](../src/buddy/companion.ts) 说明，这套系统不是“随机生成一个小宠物”那么简单，而是把 companion 拆成两层：
 
-- 用用户 ID 加盐 `friend-2026-401` 做哈希，见 [`src/buddy/companion.ts#L84`](../src/buddy/companion.ts#L84)
-- 决定 rarity、species、eye、hat、shiny、stats，见 [`src/buddy/companion.ts#L91`](../src/buddy/companion.ts#L91)
-- species、稀有度、帽子、属性都不是随手写着玩的装饰
+- `bones`：确定性骨架，包含 `rarity`、`species`、`eye`、`hat`、`shiny`、`stats`
+- `soul`：模型生成的灵魂，包含 `name`、`personality`
+- 持久化时只存 `soul + hatchedAt`，读取时再用用户 ID 重新滚出 `bones`
+
+见 [`src/buddy/companion.ts#L78`](../src/buddy/companion.ts#L78) 与 [`src/buddy/types.ts#L103`](../src/buddy/types.ts#L103)。
+
+这个设计很值得注意，因为它同时解决了三件事：
+
+- companion 对同一个用户是稳定的，不会每次重启都变种
+- 改 `SPECIES` 列表或重命名物种时，不会把旧存档搞坏
+- 用户也不能靠手改配置把自己伪造成 `legendary`
+
+代码里甚至把这件事写得很直白：`Bones never persist`，见 [`src/buddy/companion.ts#L124`](../src/buddy/companion.ts#L124)。
+
+更具体一点说，这个“孵化”流程是：
+
+- `companionUserId()` 优先取 `oauthAccount.accountUuid`，否则取 `userID`，再否则退到 `anon`，见 [`src/buddy/companion.ts#L119`](../src/buddy/companion.ts#L119)
+- 用 `userId + "friend-2026-401"` 做哈希种子，见 [`src/buddy/companion.ts#L78`](../src/buddy/companion.ts#L78)
+- 再喂给一个很小的 seeded PRNG `mulberry32()`，见 [`src/buddy/companion.ts#L14`](../src/buddy/companion.ts#L14)
+- 最后按固定顺序 roll 出 rarity、species、eye、hat、shiny、stats，见 [`src/buddy/companion.ts#L83`](../src/buddy/companion.ts#L83)
+
+这意味着：真正“每一个用户独有 buddy”的只有名字和 personality；而从静态源码可以完整还原的，是全部确定性的 body archetype，也就是下面会列出来的 18 种 species、眼睛、帽子和属性滚点规则。
+
+### 6.3 稀有度、眼睛、帽子和属性都做成了完整抽卡规则
 
 对应类型定义在 [`src/buddy/types.ts`](../src/buddy/types.ts)：
 
-- 稀有度：`common` 到 `legendary`
-- 物种：`duck`、`goose`、`blob`、`cat`、`dragon`、`octopus`、`penguin`、`capybara` 等
+- 稀有度：`common`、`uncommon`、`rare`、`epic`、`legendary`
+- 物种：共 18 种，分别是 `duck`、`goose`、`blob`、`cat`、`dragon`、`octopus`、`owl`、`penguin`、`turtle`、`snail`、`ghost`、`axolotl`、`capybara`、`cactus`、`robot`、`rabbit`、`mushroom`、`chonk`
+- 眼睛：`·`、`✦`、`×`、`◉`、`@`、`°`
+- 帽子：`none`、`crown`、`tophat`、`propeller`、`halo`、`wizard`、`beanie`、`tinyduck`
 - 属性：`DEBUGGING`、`PATIENCE`、`CHAOS`、`WISDOM`、`SNARK`
 
 见 [`src/buddy/types.ts#L1`](../src/buddy/types.ts#L1)。
 
-其中还有一个很有意思的注释：物种名里有一个会撞上“模型代号 canary”，所以代码故意用 `String.fromCharCode` 动态构造，避免字面量进入 bundle，见 [`src/buddy/types.ts#L10`](../src/buddy/types.ts#L10)。这已经不是普通 UI 彩蛋，而是“彩蛋与内部安全约束共存”。
+其中一些细节已经明显不是“随便玩玩”的水平：
 
-### 6.3 Clawd 是可以点击互动的
+- 稀有度权重是明确写死的：`60 / 25 / 10 / 4 / 1`，见 [`src/buddy/types.ts#L126`](../src/buddy/types.ts#L126)
+- `common` 不戴帽子，非 `common` 才会从帽子池抽一顶，见 [`src/buddy/companion.ts#L87`](../src/buddy/companion.ts#L87)
+- `shiny` 概率固定为 `1%`，见 [`src/buddy/companion.ts#L88`](../src/buddy/companion.ts#L88)
+- 属性不是平均分配，而是“一项峰值、一项短板、其他散点”，并且 rarity 会抬高属性地板，见 [`src/buddy/companion.ts#L51`](../src/buddy/companion.ts#L51)
+
+也就是说，这套 buddy 实际上已经具备一套很轻量的“收集游戏”语法。
+
+其中还有一个很有意思的注释：物种名里有一个会撞上“模型代号 canary”，所以代码故意用 `String.fromCharCode` 动态构造全部 species 名，避免字面量进入 bundle，见 [`src/buddy/types.ts#L4`](../src/buddy/types.ts#L4)。这已经不是普通 UI 彩蛋，而是“彩蛋与内部安全约束共存”。
+
+### 6.4 它还有完整的上线节奏、发现机制和交互闭环
+
+`buddy` 不只是藏在代码里，它还有一套相当完整的投放路径：
+
+- 2026 年 4 月 1 日到 2026 年 4 月 7 日，本地日期命中 teaser window 且用户还没 hatch companion 时，启动会弹一个彩虹色 `/buddy` 提示，持续 15 秒，见 [`src/buddy/useBuddyNotification.tsx#L8`](../src/buddy/useBuddyNotification.tsx#L8)
+- 从 2026 年 4 月开始，`isBuddyLive()` 就会返回 true，说明命令本身被视作正式上线，见 [`src/buddy/useBuddyNotification.tsx#L14`](../src/buddy/useBuddyNotification.tsx#L14)
+- 输入框会对 `/buddy` 关键字做彩虹高亮，见 [`src/buddy/useBuddyNotification.tsx#L79`](../src/buddy/useBuddyNotification.tsx#L79) 和 [`src/components/PromptInput/PromptInput.tsx#L728`](../src/components/PromptInput/PromptInput.tsx#L728)
+- Footer 里如果选中 `companion`，回车会直接提交 `/buddy`，见 [`src/components/PromptInput/PromptInput.tsx#L1788`](../src/components/PromptInput/PromptInput.tsx#L1788)
+
+有一个需要如实说明的点：
+
+- `commands.ts` 明确注册了 `./commands/buddy/index.js`，见 [`src/commands.ts#L118`](../src/commands.ts#L118)
+- 但当前泄露出的 `src/` 目录里没有这份实现文件
+
+所以关于 `/buddy` 命令本身的全部子动作，我们不能百分之百逐条复原；但从旁边的状态位和 UI 行为来看，至少可以确定它涉及 hatch，而且还存在 `/buddy pet` 这种互动动作，因为 `companionPetAt` 的注释已经直接写了“Timestamp of last /buddy pet”，见 [`src/state/AppStateStore.ts#L170`](../src/state/AppStateStore.ts#L170)。
+
+### 6.5 运行时交互不是静态装饰，而是一个完整的小状态机
+
+这一层主要散落在 [`src/buddy/CompanionSprite.tsx`](../src/buddy/CompanionSprite.tsx)、[`src/screens/REPL.tsx`](../src/screens/REPL.tsx)、[`src/utils/config.ts`](../src/utils/config.ts)：
+
+- companion 有常驻渲染位，会占用输入框右边的宽度，见 [`src/buddy/CompanionSprite.tsx#L167`](../src/buddy/CompanionSprite.tsx#L167)
+- 窄终端下会退化成单行 `face + name/quip` 模式，见 [`src/buddy/CompanionSprite.tsx#L225`](../src/buddy/CompanionSprite.tsx#L225)
+- 宽终端下会渲染完整 ASCII sprite，并跑 500ms tick 的 idle/fidget/blink 动画序列，见 [`src/buddy/CompanionSprite.tsx#L18`](../src/buddy/CompanionSprite.tsx#L18) 与 [`src/buddy/CompanionSprite.tsx#L242`](../src/buddy/CompanionSprite.tsx#L242)
+- 如果被 pet，会有大约 2.5 秒的爱心上浮动画，见 [`src/buddy/CompanionSprite.tsx#L19`](../src/buddy/CompanionSprite.tsx#L19)
+- 如果说话，会出现 speech bubble，大约 10 秒后消失，最后约 3 秒进入 fade，见 [`src/buddy/CompanionSprite.tsx#L17`](../src/buddy/CompanionSprite.tsx#L17)
+- 非全屏模式下气泡贴着 sprite 左侧；全屏模式下气泡浮到右下角 overlay 层，见 [`src/buddy/CompanionSprite.tsx#L277`](../src/buddy/CompanionSprite.tsx#L277)
+- 用户一滚动 transcript，就把气泡关掉，避免挡住内容，见 [`src/screens/REPL.tsx#L1297`](../src/screens/REPL.tsx#L1297)
+- 说话内容来自 `fireCompanionObserver(...)`，它在每轮 query 结束后被调用，见 [`src/screens/REPL.tsx#L2803`](../src/screens/REPL.tsx#L2803)
+
+这里还有第二个要谨慎说明的点：
+
+- `AppStateStore` 注释写的是 `friend observer (src/buddy/observer.ts)`，见 [`src/state/AppStateStore.ts#L168`](../src/state/AppStateStore.ts#L168)
+- 但 `src/buddy/observer.ts` 这份源码在当前目录里同样缺失
+
+因此，我们能确认“它会在每轮对话后给一个 companion reaction”，但 reaction 的具体 prompt 和筛选规则，现在还不能从这份泄露目录里完整复原。
+
+### 6.6 把每一个 buddy 原型都还原出来
+
+如果严格说“每一个 buddy”，静态源码其实只能完整还原“每一种 body archetype”，不能还原每个用户专属的名字与 personality，因为后者属于模型生成的 `soul`。但仅就可确定的部分而言，18 个 species 已经可以逐个还原。
+
+下面这份图鉴基于 [`src/buddy/sprites.ts`](../src/buddy/sprites.ts) 的 frame 0，统一用 `◉` 代替眼睛，并省略顶部统一的帽子空位；真实运行时还会叠加不同眼型、帽子和 3 帧动画。
+
+```text
+duck
+    __
+  <(◉ )___
+   (  ._>
+    `--´
+
+goose
+     (◉>
+     ||
+   _(__)_
+    ^^^^
+
+blob
+   .----.
+  ( ◉  ◉ )
+  (      )
+   `----´
+
+cat
+   /\_/\
+  ( ◉   ◉)
+  (  ω  )
+  (")_(")
+
+dragon
+  /^\  /^\
+ <  ◉  ◉  >
+ (   ~~   )
+  `-vvvv-´
+
+octopus
+   .----.
+  ( ◉  ◉ )
+  (______)
+  /\/\/\/\
+
+owl
+   /\  /\
+  ((◉)(◉))
+  (  ><  )
+   `----´
+
+penguin
+  .---.
+  (◉>◉)
+ /(   )\
+  `---´
+
+turtle
+   _,--._
+  ( ◉  ◉ )
+ /[______]\
+  ``    ``
+
+snail
+ ◉    .--.
+  \  ( @ )
+   \_`--´
+  ~~~~~~~
+
+ghost
+   .----.
+  / ◉  ◉ \
+  |      |
+  ~`~``~`~
+
+axolotl
+}~(______)~{
+}~(◉ .. ◉)~{
+  ( .--. )
+  (_/  \_)
+
+capybara
+  n______n
+ ( ◉    ◉ )
+ (   oo   )
+  `------´
+
+cactus
+ n  ____  n
+ | |◉  ◉| |
+ |_|    |_|
+   |    |
+
+robot
+   .[||].
+  [ ◉  ◉ ]
+  [ ==== ]
+  `------´
+
+rabbit
+   (\__/)
+  ( ◉  ◉ )
+ =(  ..  )=
+  (")__(")
+
+mushroom
+ .-o-OO-o-.
+(__________)
+   |◉  ◉|
+   |____|
+
+chonk
+  /\    /\
+ ( ◉    ◉ )
+ (   ..   )
+  `------´
+```
+
+如果再配合 [`renderFace(...)`](../src/buddy/sprites.ts#L303) 看，会发现不同 species 不只是“大图不同”，连窄终端模式下的一行脸谱都分别设计了：
+
+- `duck` / `goose` 是 `(${eye}>`
+- `cat` 是 `=${eye}ω${eye}=`
+- `dragon` 是 `<${eye}~${eye}>`
+- `octopus` 是 `~(${eye}${eye})~`
+- `axolotl` 是 `}${eye}.${eye}{`
+- `robot` 是 `[${eye}${eye}]`
+
+这说明团队并不是只做了一个“随机宠物贴图”，而是把 buddy 当作一整套可收集、可识别、可互动的 companion UI 系统在做。
+
+### 6.7 Clawd 是可以点击互动的
 
 `LogoV2` 里的 `Clawd` 不是静态 logo。  
 [`src/components/LogoV2/AnimatedClawd.tsx`](../src/components/LogoV2/AnimatedClawd.tsx) 里明确做了：
@@ -241,14 +436,14 @@ export default { isEnabled: () => false, isHidden: true, name: 'stub' };
 
 这类细节对主能力没有任何必要，但对产品气质很重要，所以它很典型地属于“工程化彩蛋”。
 
-### 6.4 `/stickers` 是直接通向周边页面的
+### 6.8 `/stickers` 是直接通向周边页面的
 
 `/stickers` 也不是玩笑命令。  
 它会直接打开 `https://www.stickermule.com/claudecode`，见 [`src/commands/stickers/stickers.ts#L4`](../src/commands/stickers/stickers.ts#L4)。
 
 这说明团队把实体周边都当成产品体系的一部分接入了命令界面。
 
-### 6.5 `passes` / guest passes / referral upsell 也带明显“产品彩蛋感”
+### 6.9 `passes` / guest passes / referral upsell 也带明显“产品彩蛋感”
 
 [`src/components/LogoV2/GuestPassesUpsell.tsx`](../src/components/LogoV2/GuestPassesUpsell.tsx) 里会：
 
