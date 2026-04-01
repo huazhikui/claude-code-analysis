@@ -108,6 +108,7 @@ claude-code-analysis/
 
 - [第十二章：额外探索与补充发现](./analysis/06-extra-findings.md)
 - [第十三章：隐藏命令、Feature Flags 与彩蛋](./analysis/11-hidden-features-and-easter-eggs.md)
+- [第十四章：负面关键词检测与挫败感信号机制](./analysis/06b-negative-keyword-analysis.md)
 
 ### 第六部分：组件体系详解
 
@@ -121,17 +122,17 @@ claude-code-analysis/
 
 ### 第七部分：同类产品对比
 
-- [第十四章：同类产品对比](./analysis/08-competitive-comparison.md)
+- [第十五章：同类产品对比](./analysis/08-competitive-comparison.md)
 - [附录A：外部对比资料](./analysis/08-reference-comparison-sources.md)
 
 ### 第八部分：证据与资料
 
-- [第十五章：代码证据索引](./analysis/07-code-evidence-index.md)
+- [第十六章：代码证据索引](./analysis/07-code-evidence-index.md)
 - [附录B：src 详细文件树（含文件说明）](./analysis/10-src-file-tree.md)
 
 ### 第九部分：总结
 
-- [第十六章：总结结论](./analysis/09-final-summary.md)
+- [第十七章：总结结论](./analysis/09-final-summary.md)
 
 ---
 
